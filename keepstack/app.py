@@ -175,6 +175,9 @@ async def upload_assets(
 
 
 MAX_TAG_FILTERS = 50
+# Larger integers pass FastAPI's int parsing but overflow SQLite's INTEGER
+# binding (OverflowError -> 500); cap them so they are rejected with 422.
+SQLITE_MAX_INT = 2**63 - 1
 _SORT_PATTERN = "^(newest|oldest|name|largest)$"
 
 
@@ -192,18 +195,19 @@ def list_assets(
     tag: Optional[str] = None,
     tags: list[str] = Query(default=[]),
     exclude_tags: list[str] = Query(default=[]),
-    collection_id: Optional[int] = None,
-    status: str = "active",
+    collection_id: Optional[int] = Query(None, ge=0, le=SQLITE_MAX_INT),
     sort: str = Query("newest", pattern=_SORT_PATTERN),
     mode: str = "keyword",
     limit: int = Query(60, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=SQLITE_MAX_INT),
     user: dict = Depends(require_user),
 ):
+    # Always active-only: the former `status` query parameter let the list
+    # return deleted assets while the export (correctly) never does.
     return search.search(q=q, media_type=media_type, tag=tag,
                          tags=_tag_list(tags, "tags"),
                          exclude_tags=_tag_list(exclude_tags, "exclude_tags"),
-                         collection_id=collection_id, status=status, sort=sort, mode=mode,
+                         collection_id=collection_id, status="active", sort=sort, mode=mode,
                          limit=limit, offset=offset)
 
 
@@ -220,7 +224,7 @@ def export_assets_csv(
     tag: Optional[str] = None,
     tags: list[str] = Query(default=[]),
     exclude_tags: list[str] = Query(default=[]),
-    collection_id: Optional[int] = None,
+    collection_id: Optional[int] = Query(None, ge=0, le=SQLITE_MAX_INT),
     sort: str = Query("newest", pattern=_SORT_PATTERN),
     user: dict = Depends(require_user),
 ):
@@ -367,7 +371,9 @@ def add_tag(uuid: str, request: Request, body: dict = Body(...),
     return {"ok": True}
 
 
-@app.delete("/api/assets/{uuid}/tags/{name}")
+# {name:path}: tag names may contain "/" (sent as %2F); a plain {name}
+# segment cannot match them and the request fell through to 405.
+@app.delete("/api/assets/{uuid}/tags/{name:path}")
 def remove_tag(uuid: str, name: str, user: dict = Depends(require_role("contributor"))):
     a = _get_asset_or_404(uuid)
     with transaction() as conn:
