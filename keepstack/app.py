@@ -182,8 +182,8 @@ def list_assets(
     status: str = "active",
     sort: str = "newest",
     mode: str = "keyword",
-    limit: int = Query(60, le=200),
-    offset: int = 0,
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     user: dict = Depends(require_user),
 ):
     return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,

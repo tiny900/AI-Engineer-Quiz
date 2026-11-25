@@ -16,11 +16,14 @@ from typing import Optional
 from . import ai
 from .db import get_conn
 
+# Every sort ends with a unique key (a.id) so the order is total: rows that
+# share a created_at (bulk imports, seeded data) keep a fixed relative order
+# and LIMIT/OFFSET pages never repeat or skip them.
 SORTS = {
-    "newest": "a.created_at DESC",
-    "oldest": "a.created_at ASC",
-    "name": "a.title ASC",
-    "largest": "a.size DESC",
+    "newest": "a.created_at DESC, a.id DESC",
+    "oldest": "a.created_at ASC, a.id ASC",
+    "name": "a.title ASC, a.id ASC",
+    "largest": "a.size DESC, a.id DESC",
 }
 
 
@@ -52,10 +55,13 @@ def search(
     params: list = [status]
     join = ""
 
-    if q.strip():
+    # Input made only of punctuation has no searchable terms; treat it like a
+    # blank box instead of sending an empty (invalid) MATCH expression.
+    fts = _fts_query(q)
+    if fts:
         join += " JOIN asset_fts f ON f.rowid = a.id"
         where.append("asset_fts MATCH ?")
-        params.append(_fts_query(q))
+        params.append(fts)
     if media_type:
         where.append("a.media_type = ?")
         params.append(media_type)
@@ -63,12 +69,14 @@ def search(
         join += (" JOIN asset_tags at ON at.asset_id = a.id"
                  " JOIN tags t ON t.id = at.tag_id AND t.name = ?")
         params.append(tag.lower())
-    if collection_id:
+    if collection_id is not None:
         join += " JOIN collection_assets ca ON ca.asset_id = a.id AND ca.collection_id = ?"
         params.append(collection_id)
 
     where_sql = " AND ".join(where)
-    order = "bm25(asset_fts)" if q.strip() else SORTS.get(sort, SORTS["newest"])
+    # The chosen sort applies with or without a keyword (it used to be
+    # silently replaced by bm25 relevance whenever q was set).
+    order = SORTS.get(sort, SORTS["newest"])
 
     total = conn.execute(
         f"SELECT COUNT(*) AS c FROM assets a{join} WHERE {where_sql}", params
