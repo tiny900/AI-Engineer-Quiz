@@ -349,3 +349,25 @@ def test_export_starts_with_utf8_bom(client, scenario):
     cid, _ = scenario
     r = client.get("/api/assets/export.csv", params={"collection_id": cid})
     assert r.content.startswith(b"\xef\xbb\xbfuuid,")
+
+
+@pytest.mark.parametrize("value", ["=1+1", "+SUM(A1)", "-5% off", "@cmd", "\tlead tab", "\rlead cr"])
+def test_export_neutralises_spreadsheet_formulas(client, scenario, value):
+    """Cells a spreadsheet would evaluate get a leading apostrophe (CSV injection)."""
+    cid, _ = scenario
+    hero = next(i for i in _list(client, collection_id=cid, limit=200)["items"] if i["title"] == "Harbor sunrise hero")
+    uid = hero["uuid"]
+    client.patch(f"/api/assets/{uid}", json={"title": value + " harbor", "description": value})
+    client.post(f"/api/assets/{uid}/tags", json={"name": "=hyperlink"})
+    row = next(r for r in _export(client, collection_id=cid) if r["uuid"] == uid)
+    assert row["title"] == "'" + value + " harbor"
+    assert row["description"] == "'" + value
+    assert row["tags"] == "'=hyperlink|approved|campaign"
+    # The list API still returns the stored value unchanged.
+    assert next(i for i in _list(client, collection_id=cid, limit=200)["items"] if i["uuid"] == uid)["title"] == value + " harbor"
+
+
+def test_export_leaves_ordinary_text_untouched(client, scenario):
+    cid, _ = scenario
+    rows = _export(client, collection_id=cid, **SCENARIO)
+    assert all(not r[c].startswith("'") for r in rows for c in ("title", "description", "filename", "tags"))

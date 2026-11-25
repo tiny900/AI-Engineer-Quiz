@@ -213,6 +213,15 @@ def list_assets(
 
 EXPORT_COLUMNS = ["uuid", "title", "description", "filename", "media_type", "tags", "created_at"]
 EXPORT_TAG_SEPARATOR = "|"
+# Spreadsheet apps evaluate a cell starting with one of these as a formula
+# (CSV/formula injection, OWASP). Such cells get a leading apostrophe, which
+# Excel/LibreOffice/Sheets show as plain text. Trade-off: the raw value in
+# the file gains that one character.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: str) -> str:
+    return "'" + value if value.startswith(_FORMULA_PREFIXES) else value
 
 
 # Declared before /api/assets/{uuid} so "export.csv" is not taken for a uuid.
@@ -237,12 +246,15 @@ def export_assets_csv(
     buf = io.StringIO()
     # The BOM lets Excel detect UTF-8 so Chinese text is not garbled; the csv
     # module quotes fields containing commas, quotes or newlines (RFC 4180).
-    buf.write("﻿")
+    buf.write("\ufeff")
     w = csv.writer(buf, lineterminator="\r\n")
     w.writerow(EXPORT_COLUMNS)
     for r in rows:
-        w.writerow([r["uuid"], r["title"] or "", r["description"] or "", r["filename"] or "",
-                    r["media_type"] or "", EXPORT_TAG_SEPARATOR.join(r["tags"]), r["created_at"]])
+        # User-editable text columns are neutralised; uuid, media_type and
+        # created_at are system-generated.
+        w.writerow([r["uuid"], _csv_safe(r["title"] or ""), _csv_safe(r["description"] or ""),
+                    _csv_safe(r["filename"] or ""), r["media_type"] or "",
+                    _csv_safe(EXPORT_TAG_SEPARATOR.join(r["tags"])), r["created_at"]])
     log("asset.export", user=user, target_type="asset", detail=f"{len(rows)} rows",
         ip=client_ip(request))
     stamp = now_iso()[:19].replace(":", "").replace("-", "")
