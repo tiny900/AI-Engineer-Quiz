@@ -108,7 +108,8 @@ function wireTagInput(sel, key) {
     if (!t || state[key].includes(t)) return;
     state[key] = [...state[key], t]; applyFilters();
   };
-  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); } });
+  // Only Enter commits: tag names may legitimately contain commas.
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } });
   el.addEventListener("change", () => { if (el.value && $$("#tag-options option").some(o => o.value === el.value)) add(); });
 }
 wireTagInput("#f-tags", "tags");
@@ -325,23 +326,27 @@ async function openAsset(uuid) {
 
   // wire detail actions
   $$("#drawer-body .similar-strip img").forEach(img => img.addEventListener("click", () => openAsset(img.dataset.uuid)));
+  // Edits used to fail silently (unhandled rejection); report the reason.
+  const attempt = async (what, fn) => {
+    try { await fn(); } catch (err) { toast(`${what} failed: ${err.message}`, "err"); }
+  };
   if (canEdit) {
-    $("#d-save")?.addEventListener("click", async () => {
+    $("#d-save")?.addEventListener("click", () => attempt("Save", async () => {
       const body = {};
       ["title","description","alt_text","dc_creator","rights_statement","retention_until"].forEach(f => { const el = $("#e-"+f); if (el) body[f] = el.value; });
       await api("/api/assets/"+uuid, { method: "PATCH", json: body });
       toast("Saved"); openAsset(uuid); loadLibrary();
-    });
-    $("#tag-add")?.addEventListener("keydown", async (e) => {
-      if (e.key === "Enter" && e.target.value.trim()) {
+    }));
+    $("#tag-add")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.target.value.trim()) attempt("Adding tag", async () => {
         await api("/api/assets/"+uuid+"/tags", { json: { name: e.target.value.trim() } });
         openAsset(uuid); loadLibrary(); loadFilterOptions();
-      }
+      });
     });
-    $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", async () => {
+    $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", () => attempt("Removing tag", async () => {
       await api("/api/assets/"+uuid+"/tags/"+encodeURIComponent(rm.dataset.tag), { method: "DELETE" });
       openAsset(uuid); loadLibrary();
-    }));
+    })));
     $("#d-share")?.addEventListener("click", async () => {
       const r = await api("/api/shares", { json: { target_type: "asset", target_id: a.id, permission: "download" } });
       await navigator.clipboard?.writeText(r.url).catch(()=>{});
@@ -350,8 +355,10 @@ async function openAsset(uuid) {
   }
   $("#d-delete")?.addEventListener("click", async () => {
     if (!confirm("Delete this asset?")) return;
-    await api("/api/assets/"+uuid, { method: "DELETE" });
-    toast("Deleted"); closeDrawer(); loadLibrary();
+    await attempt("Delete", async () => {
+      await api("/api/assets/"+uuid, { method: "DELETE" });
+      toast("Deleted"); closeDrawer(); loadLibrary();
+    });
   });
 }
 
