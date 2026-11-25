@@ -22,6 +22,18 @@ uv run --no-sync python -m pytest -q             # 自动化测试
 
 不用 uv 时，也可以按 CI 的方式安装：`pip install -r requirements.txt pytest httpx`。
 
+### 前端端到端测试（安装可选，交付前已实际运行）
+
+```bash
+uv pip install -e '.[dev,e2e]'                       # 额外安装 playwright
+uv run --no-sync python -m playwright install chromium   # 下载 Playwright 的 Chromium（约 150 MB）
+uv run --no-sync python -m pytest tests/e2e -v
+```
+
+测试会自己启动一个使用临时数据目录的 keepstack 进程，用 `seed-quiz` 造数据，再驱动真实浏览器操作页面。也可以设置 `KEEPSTACK_E2E_BROWSER_CHANNEL=msedge`（或 `chrome`）改用本机已安装的浏览器。
+
+没有安装 playwright 时，`tests/e2e` 会整体跳过，所以默认的 `pytest` 和 CI 行为不变。
+
 ### 页面上复现业务场景
 
 1. 集合选 **Harbor Campaign**，顶部关键词输入 `harbor`。
@@ -36,7 +48,20 @@ uv run --no-sync python -m pytest -q             # 自动化测试
 
 ## 2. 实测结果
 
-- `pytest`：**87 passed, 2 skipped**。2 个跳过的是原有的 CLIP / OCR 测试，本机没有对应模型和 Tesseract。
+- `pytest`（装了 `[e2e]` 和 Chromium 的环境）：**91 passed, 2 skipped**。其中 87 个是后端测试，4 个是前端端到端测试；2 个跳过的是原有的 CLIP / OCR 测试，本机没有对应模型和 Tesseract。
+- `pytest`（按 CI 方式安装的全新 Python 3.10 环境，没有 playwright）：**87 passed, 3 skipped**，多出来的 1 个跳过就是 `tests/e2e`（原因：`e2e extra not installed`）。
+
+### 前端端到端测试实测
+
+| 运行方式 | 命令 | 结果 |
+| --- | --- | --- |
+| Playwright 自带的 Chromium 159（文档中的默认方式） | `python -m pytest tests/e2e -v` | **4 passed**，约 8 秒 |
+| 本机 Edge | `KEEPSTACK_E2E_BROWSER_CHANNEL=msedge python -m pytest tests/e2e -v` | **4 passed**，约 9 秒 |
+| 注入错误：去掉请求序号检查 | 同上 | 1 failed（`..._not_aborted`），其余 3 个通过 |
+| 注入错误：修改条件时不重置页码 | 同上 | 1 failed（`..._return_to_first_page`），其余 3 个通过 |
+| 注入错误：导出失败时不弹提示 | 同上 | 1 failed（`..._reports_failure`），其余 3 个通过 |
+
+注入错误的检查完成后，`web/app.js` 已还原。
 - 新增 [tests/test_search_export.py](tests/test_search_export.py) 共 65 个用例，覆盖：
   - 业务场景，以及每个筛选条件单独起作用；
   - 包含标签逐个都会检查（只有 `approved`、只有 `campaign` 的素材都被排除，与标签顺序无关），多个排除标签中任意一个命中即排除；
@@ -52,6 +77,11 @@ uv run --no-sync python -m pytest -q             # 自动化测试
   - 修改标题、描述，增删标签（包括只通过标签命中关键词的情况），软删除之后，下一次查询和导出都随之变化。
 - **测试有效性检查**：临时把实现改成"包含标签只检查最后一个""排除标签只检查第一个"，或回退审核后的各项修复（包括公式注入防护），对应用例都会失败。检查完已还原。
 - 第一版提交后用 Codex 做了一轮独立审核，确认的问题已在 `600b897`、`93b9365`、`12f02c2` 中修复。
+- **前端端到端测试** [tests/e2e/test_library_ui.py](tests/e2e/test_library_ui.py)：结果见下方"前端端到端测试实测"。共 4 个用例，覆盖后端测试无法证明的三类行为：
+  1. **快速切换条件，只显示最新结果**。先发起的 `lighthouse` 请求被拦住，等后发的 `ferry` 结果显示出来之后再放行，页面必须仍然显示 `ferry` 的结果。分两种情况测：一种保留 AbortController；另一种去掉 abort 信号，让迟到的响应真正送达页面，单独证明请求序号检查有效。
+  2. **修改筛选或排序后回到第一页**。在第 2 页分别修改排序、添加排除标签、移除条件 chip、点 Clear all，每次都回到第 1 页，总数也随之更新。
+  3. **导出**。真实下载文件后，检查它带 BOM、共 14 行、顺序与两页列表一致。再分别模拟服务端 500 和网络中断，确认会弹出带原因的失败提示，按钮恢复可用。
+- **前端测试有效性检查**：临时往 `web/app.js` 注入三种错误（去掉请求序号检查、改条件时不重置页码、导出失败不弹提示），分别只有对应的用例失败。检查完已还原。
 - 浏览器手工验证（本地 Chrome 内核）：
   - 业务场景结果为 14 条，翻页正确，生效条件 chip 可以单独移除或"Clear all"；
   - 导出文件名和内容正确；
@@ -87,14 +117,15 @@ uv run --no-sync python -m pytest -q             # 自动化测试
 - **CSV 公式注入防护**：标题、描述、文件名、标签这些用户可编辑的列，如果以 `=` `+` `-` `@`、制表符或回车开头，导出时在前面加一个 `'`（OWASP 的通用做法），Excel、LibreOffice、Google Sheets 会把它当文本显示，不会执行公式。uuid、media_type、created_at 由系统生成，不做处理。代价是这类值在 CSV 文件里多了一个 `'`，例如 `-5% off` 导出为 `'-5% off`；列表接口和数据库里的值不变。之所以选择默认开启而不是做成开关，是因为这份清单的主要用途就是用表格软件打开。
 - **导出鉴权**：沿用 Bearer token。普通 `<a href>` 带不上请求头，所以前端用 `fetch` 拿到 blob 再触发下载，失败时 toast 提示。导出会写审计日志 `asset.export`。
 - **前端竞态**：新请求会 `abort` 旧请求，同时用请求序号丢弃晚到的响应。只用其中一种不够：abort 来不及取消已经返回的响应，单靠序号又会浪费请求。
-- **没有引入新依赖**。`httpx` 原本就在 `[dev]` 依赖里，只是 CI 漏装了，已补上。CI 也改为在 `feature/**` 分支 push 时运行。
+- **运行时没有引入新依赖**。`httpx` 原本就在 `[dev]` 依赖里，只是 CI 漏装了，已补上。CI 也改为在 `feature/**` 分支 push 时运行。
+- **前端测试用 Playwright，放在可选的 `[e2e]` 依赖里**。收益：竞态、页码重置、下载这几类行为只能在真实浏览器里证明。成本：要额外下载浏览器，单次运行约 10 秒。所以没有加进 CI 的默认步骤，避免拖慢 CI，也避免在干净环境里因为缺浏览器而失败。代价是这部分测试要手动运行；交付前我已经实际跑过（见上方"前端端到端测试实测"）。
 - 语义搜索入口已隐藏，接口保留不动。
 
 ## 5. 限制与未完成项
 
 - 标签名本身含 `|` 时，导出列存在歧义（当前数据里没有这种情况）。
 - 语义模式（`mode=semantic`）不支持新的标签和集合筛选，入口已隐藏。
-- 前端没有浏览器自动化测试。条件重置、乱序响应、失败重试、下载失败等前端行为只做了上面列出的手工验证；pytest 覆盖的是后端接口的行为。
+- 前端端到端测试只覆盖上面三类行为，而且不在 CI 里自动运行。列表加载失败后的重试、条件 chip 的显示样式、移动端布局仍然只做了手工验证。
 - 移动端布局只依赖原有样式的自动换行，没有专门适配。
 
 ### 发现但不在本题范围内的问题
