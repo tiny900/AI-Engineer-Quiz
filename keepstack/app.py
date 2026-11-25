@@ -6,6 +6,7 @@ single-page web client is served from the ``web/`` directory at the root.
 """
 from __future__ import annotations
 
+import csv
 import io
 import ipaddress
 import json
@@ -173,21 +174,80 @@ async def upload_assets(
     return {"created": results}
 
 
+MAX_TAG_FILTERS = 50
+_SORT_PATTERN = "^(newest|oldest|name|largest)$"
+
+
+def _tag_list(values: list[str], name: str) -> list[str]:
+    tags = search.normalize_tags(values)
+    if len(tags) > MAX_TAG_FILTERS:
+        raise HTTPException(422, f"At most {MAX_TAG_FILTERS} {name} allowed")
+    return tags
+
+
 @app.get("/api/assets")
 def list_assets(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
+    tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
     collection_id: Optional[int] = None,
     status: str = "active",
-    sort: str = "newest",
+    sort: str = Query("newest", pattern=_SORT_PATTERN),
     mode: str = "keyword",
     limit: int = Query(60, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
-                         status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+    return search.search(q=q, media_type=media_type, tag=tag,
+                         tags=_tag_list(tags, "tags"),
+                         exclude_tags=_tag_list(exclude_tags, "exclude_tags"),
+                         collection_id=collection_id, status=status, sort=sort, mode=mode,
+                         limit=limit, offset=offset)
+
+
+EXPORT_COLUMNS = ["uuid", "title", "description", "filename", "media_type", "tags", "created_at"]
+EXPORT_TAG_SEPARATOR = "|"
+
+
+# Declared before /api/assets/{uuid} so "export.csv" is not taken for a uuid.
+@app.get("/api/assets/export.csv")
+def export_assets_csv(
+    request: Request,
+    q: str = "",
+    media_type: Optional[str] = None,
+    tag: Optional[str] = None,
+    tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
+    collection_id: Optional[int] = None,
+    sort: str = Query("newest", pattern=_SORT_PATTERN),
+    user: dict = Depends(require_user),
+):
+    """CSV manifest of ALL assets matching the same filters/sort as the list
+    (no paging). Metadata only, never the files themselves."""
+    include = _tag_list([*tags, *([tag] if tag else [])], "tags")
+    rows = search.iter_export_rows(q=q, media_type=media_type, tags=include,
+                                   exclude_tags=_tag_list(exclude_tags, "exclude_tags"),
+                                   collection_id=collection_id, sort=sort)
+    buf = io.StringIO()
+    # The BOM lets Excel detect UTF-8 so Chinese text is not garbled; the csv
+    # module quotes fields containing commas, quotes or newlines (RFC 4180).
+    buf.write("﻿")
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(EXPORT_COLUMNS)
+    for r in rows:
+        w.writerow([r["uuid"], r["title"] or "", r["description"] or "", r["filename"] or "",
+                    r["media_type"] or "", EXPORT_TAG_SEPARATOR.join(r["tags"]), r["created_at"]])
+    log("asset.export", user=user, target_type="asset", detail=f"{len(rows)} rows",
+        ip=client_ip(request))
+    stamp = now_iso()[:19].replace(":", "").replace("-", "")
+    return Response(
+        content=buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="keepstack-assets-{stamp}.csv"',
+                 "Cache-Control": "no-store"},
+    )
 
 
 def _get_asset_or_404(uuid: str) -> dict:
