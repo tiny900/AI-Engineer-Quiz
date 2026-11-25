@@ -2,7 +2,8 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const state = { token: localStorage.getItem("keepstack_token"), user: null,
-  q: "", mode: "keyword", media: null, tag: null, sort: "newest", collection: null };
+  q: "", media: null, collection: null, tags: [], excludeTags: [], sort: "newest",
+  offset: 0, limit: 24, total: 0 };
 
 // ---------- API helper ----------
 async function api(path, opts = {}) {
@@ -14,8 +15,18 @@ async function api(path, opts = {}) {
   const method = opts.method || (opts.body !== undefined ? "POST" : "GET");
   const res = await fetch(path, { ...opts, method, headers });
   if (res.status === 401) { logout(); throw new Error("unauthorised"); }
-  if (!res.ok) { const t = await res.text(); throw new Error(t || res.statusText); }
+  if (!res.ok) throw new Error(await errorText(res));
   return res.headers.get("content-type")?.includes("json") ? res.json() : res;
+}
+// FastAPI errors are JSON ({"detail": ...}); show the detail, not the raw body.
+async function errorText(res) {
+  const t = await res.text();
+  try {
+    const d = JSON.parse(t).detail;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) return d.map(x => `${(x.loc || []).slice(-1)[0]}: ${x.msg}`).join("; ");
+  } catch {}
+  return t || `${res.status} ${res.statusText}`;
 }
 
 function toast(msg, kind = "ok") {
@@ -43,7 +54,7 @@ function enterApp() {
   $("#user-label").textContent = `${state.user.username} (${state.user.role})`;
   const isAdmin = state.user.role === "admin";
   $$(".admin-only").forEach(el => el.classList.toggle("hidden", !isAdmin));
-  loadLibrary();
+  loadFilterOptions().then(loadLibrary);
 }
 
 // ---------- navigation ----------
@@ -60,47 +71,195 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
 }));
 
 // ---------- library / search ----------
-let searchTimer;
-$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250); });
-$("#search-mode").addEventListener("change", (e) => { state.mode = e.target.value; loadLibrary(); });
-$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; loadLibrary(); });
-$("#active-filter").addEventListener("click", () => { state.media = null; state.tag = null; state.collection = null; loadLibrary(); });
-
-async function loadLibrary() {
-  const p = new URLSearchParams({ q: state.q, sort: state.sort, mode: state.mode, limit: "120" });
+// All list state lives in `state`; every filter/sort change goes through
+// applyFilters() (back to page 1), paging only moves state.offset.
+const normTag = (t) => (t || "").trim().toLowerCase();   // same rule as the server
+function hasFilters() {
+  return !!(state.q.trim() || state.media || state.collection || state.tags.length || state.excludeTags.length);
+}
+function filterParams() {
+  const p = new URLSearchParams();
+  if (state.q.trim()) p.set("q", state.q);
   if (state.media) p.set("media_type", state.media);
-  if (state.tag) p.set("tag", state.tag);
   if (state.collection) p.set("collection_id", state.collection);
-  const data = await api("/api/assets?" + p.toString());
+  state.tags.forEach(t => p.append("tags", t));
+  state.excludeTags.forEach(t => p.append("exclude_tags", t));
+  p.set("sort", state.sort);
+  return p;
+}
+function applyFilters() { state.offset = 0; loadLibrary(); }
+function clearFilters() {
+  state.q = ""; $("#search").value = ""; state.media = null; state.collection = null;
+  state.tags = []; state.excludeTags = []; applyFilters();
+}
+
+let searchTimer;
+$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(applyFilters, 250); });
+$("#search").addEventListener("keydown", (e) => { if (e.key === "Enter") { clearTimeout(searchTimer); applyFilters(); } });
+$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; applyFilters(); });
+$("#f-collection").addEventListener("change", (e) => { state.collection = e.target.value || null; applyFilters(); });
+$("#pg-size").addEventListener("change", (e) => { state.limit = +e.target.value; applyFilters(); });
+$("#pg-prev").addEventListener("click", () => { state.offset = Math.max(0, state.offset - state.limit); loadLibrary(); });
+$("#pg-next").addEventListener("click", () => { state.offset += state.limit; loadLibrary(); });
+function wireTagInput(sel, key) {
+  const el = $(sel);
+  const add = () => {
+    const t = normTag(el.value); el.value = "";
+    if (!t || state[key].includes(t)) return;
+    state[key] = [...state[key], t]; applyFilters();
+  };
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); } });
+  el.addEventListener("change", () => { if (el.value && $$("#tag-options option").some(o => o.value === el.value)) add(); });
+}
+wireTagInput("#f-tags", "tags");
+wireTagInput("#f-exclude", "excludeTags");
+
+async function loadFilterOptions() {
+  try {
+    const [cols, tags] = await Promise.all([api("/api/collections"), api("/api/tags")]);
+    $("#f-collection").innerHTML = `<option value="">Any collection</option>` +
+      cols.collections.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+    $("#f-collection").value = state.collection || "";
+    $("#tag-options").innerHTML = tags.tags.map(t => `<option value="${esc(t.name)}">`).join("");
+  } catch (err) { /* options are a convenience; typing still works */ }
+}
+
+function collectionName(id) {
+  const o = $$("#f-collection option").find(o => o.value === String(id));
+  return o ? o.textContent : "#" + id;
+}
+
+function renderActiveFilters() {
+  const chips = [];
+  const conflict = state.tags.filter(t => state.excludeTags.includes(t));
+  if (state.q.trim()) chips.push({ label: `Keyword: "${state.q.trim()}"`, clear: () => { state.q = ""; $("#search").value = ""; } });
+  if (state.collection) chips.push({ label: `Collection: ${collectionName(state.collection)}`, clear: () => { state.collection = null; } });
+  state.tags.forEach(t => chips.push({ label: `Has: ${t}`, cls: conflict.includes(t) ? "conflict" : "",
+    clear: () => { state.tags = state.tags.filter(x => x !== t); } }));
+  state.excludeTags.forEach(t => chips.push({ label: `Not: ${t}`, cls: "exclude" + (conflict.includes(t) ? " conflict" : ""),
+    clear: () => { state.excludeTags = state.excludeTags.filter(x => x !== t); } }));
+  if (state.media) chips.push({ label: `Type: ${state.media}`, clear: () => { state.media = null; } });
+  const box = $("#active-filters");
+  box.classList.toggle("hidden", !chips.length);
+  box.innerHTML = `<span class="muted">Filters:</span>` +
+    chips.map((c, i) => `<span class="chip ${c.cls || ""}" data-i="${i}" title="Remove this filter">${esc(c.label)}</span>`).join("") +
+    (conflict.length ? `<span class="warn">"${esc(conflict.join(", "))}" is both required and excluded, so nothing can match.</span>` : "") +
+    `<button class="btn-link" id="clear-filters">Clear all</button>`;
+  $$("#active-filters .chip").forEach(el => el.addEventListener("click", () => { chips[+el.dataset.i].clear(); applyFilters(); }));
+  $("#clear-filters")?.addEventListener("click", clearFilters);
+  $("#f-collection").value = state.collection || "";
+}
+
+// Only the response to the most recent request is rendered: older in-flight
+// requests are aborted, and a sequence check drops anything that still lands.
+let libSeq = 0, libAbort = null;
+async function loadLibrary() {
+  const seq = ++libSeq;
+  libAbort?.abort();
+  libAbort = new AbortController();
+  renderActiveFilters();
+  $("#grid").classList.add("loading");
+  const p = filterParams();
+  p.set("limit", state.limit); p.set("offset", state.offset);
+  let data;
+  try {
+    data = await api("/api/assets?" + p.toString(), { signal: libAbort.signal });
+  } catch (err) {
+    if (seq !== libSeq || err.name === "AbortError") return;
+    $("#grid").classList.remove("loading");
+    renderLoadError(err);
+    return;
+  }
+  if (seq !== libSeq) return;
+  $("#grid").classList.remove("loading");
+  // The page we were on can disappear (edits/deletes); fall back to the last page.
+  if (!data.items.length && data.total > 0 && state.offset > 0) {
+    state.offset = Math.floor((data.total - 1) / state.limit) * state.limit;
+    return loadLibrary();
+  }
+  state.total = data.total;
   renderFacets(data.facets);
   renderGrid(data.items, data.total);
-  const filt = state.media || (state.tag ? "#" + state.tag : null) || (state.collection ? "collection" : null);
-  $("#active-filter").classList.toggle("hidden", !filt);
-  if (filt) $("#active-filter").textContent = filt;
+  renderPager(data.total);
+}
+
+function renderLoadError(err) {
+  $("#grid").innerHTML = "";
+  $("#pager").classList.add("hidden");
+  const e = $("#empty");
+  e.className = "empty error";
+  e.innerHTML = `Couldn't load assets: ${esc(err.message)} <button class="btn" id="retry-load">Retry</button>`;
+  $("#retry-load").addEventListener("click", loadLibrary);
 }
 
 function renderGrid(items, total) {
-  $("#result-title").textContent = state.q ? `Results (${total})` : `Library (${total})`;
-  $("#empty").classList.toggle("hidden", items.length > 0);
+  $("#result-title").textContent = hasFilters() ? `Results (${total} matching)` : `Library (${total})`;
+  const e = $("#empty");
+  e.className = "empty" + (items.length ? " hidden" : "");
+  if (!items.length) {
+    e.innerHTML = hasFilters()
+      ? `No assets match these filters. <button class="btn-link" id="empty-clear">Clear filters</button>`
+      : "No assets yet. Click Upload to get started.";
+    $("#empty-clear")?.addEventListener("click", clearFilters);
+  }
   $("#grid").innerHTML = items.map(a => `
     <div class="card" data-uuid="${a.uuid}">
       <img class="thumb" loading="lazy" src="/api/assets/${a.uuid}/thumb" alt="${esc(a.alt_text || a.title)}">
       <div class="meta">
         <span class="title" title="${esc(a.title)}">${esc(a.title)}</span>
-        <span class="sub"><span class="badge">${a.media_type}</span><span>${fmtBytes(a.size)}</span></span>
+        <span class="sub"><span class="badge">${a.media_type}</span><span>${(a.created_at || "").slice(0, 10)}</span><span>${fmtBytes(a.size)}</span></span>
       </div>
     </div>`).join("");
   $$("#grid .card").forEach(c => c.addEventListener("click", () => openAsset(c.dataset.uuid)));
 }
 
+function renderPager(total) {
+  const pages = Math.max(1, Math.ceil(total / state.limit));
+  const page = Math.floor(state.offset / state.limit) + 1;
+  $("#pager").classList.toggle("hidden", total === 0);
+  const from = total ? state.offset + 1 : 0, to = Math.min(total, state.offset + state.limit);
+  $("#pg-info").textContent = `Page ${page} of ${pages} · ${from}–${to} of ${total}`;
+  $("#pg-prev").disabled = state.offset === 0;
+  $("#pg-next").disabled = state.offset + state.limit >= total;
+}
+
+// Facet counts are catalog-wide (not the current matches); headings say so.
 function renderFacets(facets) {
   $("#facet-media").innerHTML = (facets.media_types || []).map(m =>
-    `<li class="${state.media===m.value?'active':''}" data-media="${m.value}"><span>${m.value}</span><span class="count">${m.count}</span></li>`).join("");
+    `<li class="${state.media===m.value?'active':''}" data-media="${esc(m.value)}" title="${m.count} assets in the catalog"><span>${esc(m.value)}</span><span class="count">${m.count}</span></li>`).join("");
   $("#facet-tags").innerHTML = (facets.tags || []).slice(0, 18).map(t =>
-    `<li class="${state.tag===t.value?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
-  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; loadLibrary(); }));
-  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; loadLibrary(); }));
+    `<li class="${state.tags.includes(t.value)?'active':''}" data-tag="${esc(t.value)}" title="${t.count} assets in the catalog; click to require this tag"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
+  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; applyFilters(); }));
+  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => {
+    const t = li.dataset.tag;
+    state.tags = state.tags.includes(t) ? state.tags.filter(x => x !== t) : [...state.tags, t];
+    applyFilters();
+  }));
 }
+
+// CSV export: fetch with the bearer token (a plain link could not send it),
+// then hand the blob to the browser as a download.
+$("#btn-export").addEventListener("click", async () => {
+  const btn = $("#btn-export");
+  btn.disabled = true; btn.textContent = "Exporting...";
+  try {
+    const res = await fetch("/api/assets/export.csv?" + filterParams().toString(),
+                            { headers: { Authorization: "Bearer " + state.token } });
+    if (res.status === 401) { logout(); throw new Error("session expired, please sign in again"); }
+    if (!res.ok) throw new Error(await errorText(res));
+    const blob = await res.blob();
+    const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") || "")?.[1] || "assets.csv";
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement("a"), { href: url, download: name });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    toast("CSV downloaded");
+  } catch (err) {
+    toast("Export failed: " + err.message, "err");
+  } finally {
+    btn.disabled = false; btn.textContent = "Export CSV";
+  }
+});
 
 // ---------- asset detail drawer ----------
 const drawer = $("#drawer");
@@ -176,12 +335,12 @@ async function openAsset(uuid) {
     $("#tag-add")?.addEventListener("keydown", async (e) => {
       if (e.key === "Enter" && e.target.value.trim()) {
         await api("/api/assets/"+uuid+"/tags", { json: { name: e.target.value.trim() } });
-        openAsset(uuid);
+        openAsset(uuid); loadLibrary(); loadFilterOptions();
       }
     });
     $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", async () => {
       await api("/api/assets/"+uuid+"/tags/"+encodeURIComponent(rm.dataset.tag), { method: "DELETE" });
-      openAsset(uuid);
+      openAsset(uuid); loadLibrary();
     }));
     $("#d-share")?.addEventListener("click", async () => {
       const r = await api("/api/shares", { json: { target_type: "asset", target_id: a.id, permission: "download" } });
@@ -231,16 +390,16 @@ async function loadCollections() {
     `<div class="collection-card" data-id="${c.id}"><span class="n">${esc(c.name)}</span><span class="muted">${c.asset_count} assets</span><span class="muted">${esc(c.description||"")}</span></div>`).join("")
     || '<p class="muted">No collections yet.</p>';
   $$("#collection-list .collection-card").forEach(card => card.addEventListener("click", () => {
-    state.collection = card.dataset.id; state.media = null; state.tag = null;
+    state.collection = card.dataset.id;
     $$(".nav-item").forEach(b => b.classList.remove("active"));
     $('.nav-item[data-view="library"]').classList.add("active");
     $$(".view").forEach(v => v.classList.add("hidden")); $("#view-library").classList.remove("hidden");
-    loadLibrary();
+    applyFilters();
   }));
 }
 $("#btn-new-collection").addEventListener("click", async () => {
   const name = prompt("Collection name"); if (!name) return;
-  await api("/api/collections", { json: { name } }); loadCollections();
+  await api("/api/collections", { json: { name } }); loadCollections(); loadFilterOptions();
 });
 
 // ---------- dashboard ----------

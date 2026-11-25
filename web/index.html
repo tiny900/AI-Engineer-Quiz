@@ -30,11 +30,7 @@
         <strong>Keepstack</strong>
       </div>
       <div class="search-box">
-        <input id="search" placeholder="Search assets, tags, metadata...">
-        <select id="search-mode" title="Search mode">
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
+        <input id="search" type="search" placeholder="Keyword: title, description, tags, metadata..." aria-label="Keyword">
       </div>
       <div class="topbar-right">
         <button id="btn-upload" class="btn btn-primary">Upload</button>
@@ -57,11 +53,11 @@
 
         <div id="facets" class="facets">
           <div class="facet-group">
-            <h4>Media type</h4>
+            <h4>Media type <span class="facet-note">all assets</span></h4>
             <ul id="facet-media"></ul>
           </div>
           <div class="facet-group">
-            <h4>Top tags</h4>
+            <h4>Top tags <span class="facet-note">all assets</span></h4>
             <ul id="facet-tags"></ul>
           </div>
         </div>
@@ -72,17 +68,40 @@
           <div class="view-head">
             <h2 id="result-title">Library</h2>
             <div class="view-controls">
-              <span id="active-filter" class="chip hidden"></span>
-              <select id="sort">
-                <option value="newest">Newest</option>
-                <option value="oldest">Oldest</option>
-                <option value="name">Name</option>
-                <option value="largest">Largest</option>
-              </select>
+              <label class="ctl">Sort
+                <select id="sort">
+                  <option value="newest">Created: newest first</option>
+                  <option value="oldest">Created: oldest first</option>
+                  <option value="name">Name</option>
+                  <option value="largest">Largest</option>
+                </select>
+              </label>
+              <button id="btn-export" class="btn" title="Download every matching asset (all pages) as CSV">Export CSV</button>
             </div>
           </div>
+          <div class="filter-bar">
+            <label class="ctl">Collection
+              <select id="f-collection"><option value="">Any collection</option></select>
+            </label>
+            <label class="ctl">Must have tags
+              <input id="f-tags" list="tag-options" placeholder="tag + Enter" autocomplete="off">
+            </label>
+            <label class="ctl">Exclude tags
+              <input id="f-exclude" list="tag-options" placeholder="tag + Enter" autocomplete="off">
+            </label>
+            <datalist id="tag-options"></datalist>
+          </div>
+          <div id="active-filters" class="active-filters hidden" aria-live="polite"></div>
           <div id="grid" class="grid"></div>
-          <div id="empty" class="empty hidden">No assets yet. Click Upload to get started.</div>
+          <div id="empty" class="empty hidden"></div>
+          <div id="pager" class="pager hidden">
+            <button id="pg-prev" class="btn">&lsaquo; Previous</button>
+            <span id="pg-info" class="muted"></span>
+            <button id="pg-next" class="btn">Next &rsaquo;</button>
+            <label class="ctl">Per page
+              <select id="pg-size"><option>12</option><option selected>24</option><option>48</option><option>96</option></select>
+            </label>
+          </div>
         </div>
 
         <div id="view-collections" class="view hidden">
