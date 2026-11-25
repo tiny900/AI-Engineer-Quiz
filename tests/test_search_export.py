@@ -300,11 +300,14 @@ def test_list_never_returns_non_active_assets(client, scenario):
     assert [i["uuid"] for i in listed] == [r["uuid"] for r in _export(client, status="deleted", **params)]
 
 
-@pytest.mark.parametrize("path", ["/api/assets", "/api/assets/export.csv"])
-@pytest.mark.parametrize("params", [{"offset": 2**63}, {"collection_id": 2**63}, {"collection_id": -1}])
+@pytest.mark.parametrize("path,params", [
+    ("/api/assets", {"offset": 2**63}),
+    ("/api/assets", {"collection_id": 2**63}),
+    ("/api/assets", {"collection_id": -1}),
+    ("/api/assets/export.csv", {"collection_id": 2**63}),  # export has no paging params
+    ("/api/assets/export.csv", {"collection_id": -1}),
+])
 def test_out_of_range_integers_are_rejected_not_500(client, path, params):
-    if path.endswith(".csv") and "offset" in params:
-        pytest.skip("export has no paging")
     assert client.get(path, params=params).status_code == 422
 
 
