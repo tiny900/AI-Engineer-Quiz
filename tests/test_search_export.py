@@ -259,3 +259,90 @@ def test_edits_are_reflected_in_next_query_and_export(client, scenario):
     # Soft delete -> no longer active -> gone everywhere.
     assert client.delete(f"/api/assets/{uid}").status_code == 200
     assert not in_list() and not in_export()
+
+
+# ---------- added after review: tighter tag semantics & edge cases ----------
+
+def test_every_required_tag_is_checked(client, scenario):
+    """approved-only and campaign-only assets must both be rejected, in either tag order."""
+    cid, expected = scenario
+    quiz_data.add_asset(title="Harbor pier banner", created_at="2026-01-25T09:00:00+00:00",
+                        tags=["campaign"], collection_id=cid, salt=uuid.uuid4().hex)
+    for order in (["approved", "campaign"], ["campaign", "approved"]):
+        titles = [i["title"] for i in _list(client, collection_id=cid, q="harbor", tags=order,
+                                            exclude_tags=["internal"], sort="oldest", limit=200)["items"]]
+        assert titles == expected
+        assert "Harbor pier banner" not in titles and "Harbor crane detail" not in titles
+
+
+def test_any_excluded_tag_excludes(client, scenario):
+    cid, expected = scenario
+    quiz_data.add_asset(title="Harbor dock blocked", created_at="2026-01-26T09:00:00+00:00",
+                        tags=["approved", "campaign", "blocked"], collection_id=cid, salt=uuid.uuid4().hex)
+    base = dict(collection_id=cid, q="harbor", tags=["approved", "campaign"], limit=200)
+    titles = lambda ex: {i["title"] for i in _list(client, exclude_tags=ex, **base)["items"]}  # noqa: E731
+    both = titles(["internal", "blocked"])
+    assert "Harbor dock blocked" not in both and "Harbor night panorama" not in both
+    assert both == set(expected)
+    only_blocked = titles(["blocked"])
+    assert "Harbor night panorama" in only_blocked and "Harbor dock blocked" not in only_blocked
+    only_internal = titles(["internal"])
+    assert "Harbor dock blocked" in only_internal and "Harbor night panorama" not in only_internal
+    assert {r["title"] for r in _export(client, exclude_tags=["internal", "blocked"], **base)} == set(expected)
+
+
+def test_list_never_returns_non_active_assets(client, scenario):
+    """A `status` query parameter must not reopen deleted assets (export never shows them)."""
+    cid, _ = scenario
+    params = dict(collection_id=cid, limit=200, **SCENARIO)
+    listed = _list(client, status="deleted", **params)["items"]
+    assert "Harbor retired poster" not in {i["title"] for i in listed}
+    assert [i["uuid"] for i in listed] == [r["uuid"] for r in _export(client, status="deleted", **params)]
+
+
+@pytest.mark.parametrize("path", ["/api/assets", "/api/assets/export.csv"])
+@pytest.mark.parametrize("params", [{"offset": 2**63}, {"collection_id": 2**63}, {"collection_id": -1}])
+def test_out_of_range_integers_are_rejected_not_500(client, path, params):
+    if path.endswith(".csv") and "offset" in params:
+        pytest.skip("export has no paging")
+    assert client.get(path, params=params).status_code == 422
+
+
+def test_largest_valid_offset_is_an_empty_page(client):
+    data = _list(client, offset=2**63 - 1)
+    assert data["items"] == []
+
+
+@pytest.mark.parametrize("name", ["a/b", "news,2026", "50% off", "q&a #1", "引号\"标签"])
+def test_tags_with_special_characters_can_be_added_filtered_and_removed(client, scenario, name):
+    from urllib.parse import quote
+    cid, _ = scenario
+    hero = next(i for i in _list(client, collection_id=cid, limit=200)["items"] if i["title"] == "Harbor sunrise hero")
+    uid = hero["uuid"]
+    assert client.post(f"/api/assets/{uid}/tags", json={"name": name}).status_code == 200
+    assert [i["uuid"] for i in _list(client, collection_id=cid, tags=[name])["items"]] == [uid]
+    assert [r["tags"] for r in _export(client, collection_id=cid, tags=[name])] == [
+        "|".join(sorted(["approved", "campaign", name.lower()]))]
+    r = client.delete(f"/api/assets/{uid}/tags/{quote(name, safe='')}")
+    assert r.status_code == 200, r.text
+    assert _list(client, collection_id=cid, tags=[name])["total"] == 0
+
+
+def test_tag_edits_update_keyword_matches(client, scenario):
+    """Tags are an FTS field: adding/removing one changes keyword results."""
+    cid, _ = scenario
+    hero = next(i for i in _list(client, collection_id=cid, limit=200)["items"] if i["title"] == "Harbor sunrise hero")
+    uid = hero["uuid"]
+    hits = lambda: [i["uuid"] for i in _list(client, collection_id=cid, q="zephyrline")["items"]]  # noqa: E731
+    assert hits() == []
+    client.post(f"/api/assets/{uid}/tags", json={"name": "zephyrline"})
+    assert hits() == [uid]
+    assert [r["uuid"] for r in _export(client, collection_id=cid, q="zephyrline")] == [uid]
+    client.delete(f"/api/assets/{uid}/tags/zephyrline")
+    assert hits() == []
+
+
+def test_export_starts_with_utf8_bom(client, scenario):
+    cid, _ = scenario
+    r = client.get("/api/assets/export.csv", params={"collection_id": cid})
+    assert r.content.startswith(b"\xef\xbb\xbfuuid,")
